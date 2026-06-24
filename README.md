@@ -63,5 +63,7 @@ Cada carpeta tiene su propio `README.md` con objetivo, mapa de archivos y cómo 
 
 ## Licencia
 
-Mi código se publica bajo licencia [MIT](LICENSE). Esto cubre solo mi trabajo;
-no se extiende a ningún material de Anthropic.
+Este repositorio no incluye licencia por ahora, así que se aplica el copyright por
+defecto (todos los derechos reservados). La forma de publicación se decidirá con
+Saturdays.AI. En cualquier caso, esto cubre solo mi trabajo; no se extiende a
+ningún material de Anthropic.
