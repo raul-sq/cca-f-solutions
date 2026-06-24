@@ -60,10 +60,3 @@ Cada carpeta tiene su propio `README.md` con objetivo, mapa de archivos y cómo 
   [Claude API](https://docs.anthropic.com) y de
   [Claude Code](https://code.claude.com/docs), y la
   [especificación de MCP](https://modelcontextprotocol.io).
-
-## Licencia
-
-Este repositorio no incluye licencia por ahora, así que se aplica el copyright por
-defecto (todos los derechos reservados). La forma de publicación se decidirá con
-Saturdays.AI. En cualquier caso, esto cubre solo mi trabajo; no se extiende a
-ningún material de Anthropic.
