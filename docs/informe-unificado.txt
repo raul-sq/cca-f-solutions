@@ -1,0 +1,984 @@
+==============================================================================
+CCA-F — INFORME UNIFICADO DE IMPLEMENTACIÓN
+Cuatro ejercicios de la guía "Claude Certified Architect - Foundations
+Certification Exam Guide" (Anthropic)
+==============================================================================
+
+Resumen general
+---------------
+Este documento reúne en un solo informe la implementación de los cuatro
+ejercicios propuestos por la guía oficial de preparación. Cada ejercicio se
+construyó como una implementación ejecutable y se verificó contra la
+documentación oficial vigente (Claude API docs y code.claude.com/docs).
+
+Índice de ejercicios y dominios reforzados:
+
+  Ejercicio 1 - Construir un agente multi-herramienta con lógica de escalado
+                Dominio 1: Arquitectura Agéntica y Orquestación
+                Dominio 2: Diseño de Herramientas e Integración MCP
+                Dominio 5: Gestión de Contexto y Fiabilidad
+
+  Ejercicio 2 - Configurar Claude Code para un flujo de trabajo de equipo
+                Dominio 3: Configuración y Flujos de Trabajo de Claude Code
+                Dominio 2: Diseño de Herramientas e Integración MCP
+
+  Ejercicio 3 - Construir una tubería de extracción de datos estructurados
+                Dominio 4: Ingeniería de Prompts y Salida Estructurada
+                Dominio 5: Gestión de Contexto y Fiabilidad
+
+  Ejercicio 4 - Diseñar y depurar una tubería de investigación multiagente
+                Dominio 1: Arquitectura Agéntica y Orquestación
+
+Archivos de referencia de la implementación:
+  - cca_f_exercise_1.py            (Ejercicio 1, sobre Messages API en crudo)
+  - team-workflow/ (estructura)    (Ejercicio 2, configuración de Claude Code)
+  - extraction_pipeline/ (paquete) (Ejercicio 3, sobre Messages API en crudo)
+  - cca_f_exercise_4_agentsdk.py   (Ejercicio 4, sobre Claude Agent SDK)
+
+
+##############################################################################
+# EJERCICIO 1 - CONSTRUIR UN AGENTE MULTI-HERRAMIENTA CON LÓGICA DE ESCALADO
+##############################################################################
+
+Objetivo
+--------
+Diseñar un bucle agéntico con integración de herramientas, manejo estructurado
+de errores y patrones de escalado. La implementación de referencia vive en
+"cca_f_exercise_1.py" y se construye directamente sobre la Messages API de
+Anthropic en crudo (el SDK de Python `anthropic`), de modo que el bucle
+agéntico se implementa e inspecciona de forma explícita en lugar de quedar
+abstraído por un framework de nivel superior.
+
+Escenario empleado en todo el ejercicio: un agente de atención al cliente para
+una tienda online, con una pequeña base de datos de pedidos simulada. Este
+dominio produce de forma natural una regla de escalado basada en umbral
+(reembolsos grandes) y un par de herramientas genuinamente confundibles
+(reembolso a tarjeta frente a crédito en tienda).
+
+
+------------------------------------------------------------------------------
+PASO 1 - DEFINIR 3-4 HERRAMIENTAS CON DESCRIPCIONES DIFERENCIADAS
+------------------------------------------------------------------------------
+Se definen cuatro herramientas en la lista `TOOLS`, cada una con su
+input_schema y una descripción redactada para hacer inequívocos su propósito,
+sus entradas y sus límites:
+
+  1. get_order_status   - SOLO LECTURA. Devuelve el estado de envío de un
+                          pedido. Declara explícitamente que no mueve dinero ni
+                          modifica nada, para evitar que se la seleccione para
+                          reembolsos.
+
+  2. issue_refund       - Devuelve dinero al MÉTODO DE PAGO ORIGINAL del cliente
+                          (tarjeta). El dinero SALE de la tienda. Exige que el
+                          pedido sea reembolsable.
+
+  3. issue_store_credit - Acredita el SALDO INTERNO (monedero/vale). El dinero
+                          NO sale de la tienda. Se usa cuando el cliente acepta
+                          un vale o como gesto de buena voluntad.
+
+  4. escalate_to_human  - Abre un ticket para revisión/aprobación manual.
+
+Par de confusión de selección: las herramientas (2) y (3) son casi gemelas en
+su forma - mismas entradas (order_id, amount), intención solapada (compensar al
+cliente). La única señal fiable para una selección correcta es el lenguaje de
+límites de cada descripción: "el dinero sale de la tienda / tarjeta original"
+frente a "el dinero permanece como crédito interno", más una referencia cruzada
+explícita en cada descripción que indica al modelo cuándo usar la OTRA
+herramienta. Esta es la prueba deliberada de calidad de descripción que exige
+el ejercicio.
+
+Ambas direcciones de este par se ejercitan en los casos de prueba (ver "CASOS
+DE PRUEBA EJECUTADOS" más abajo): una petición de reembolso a tarjeta se
+encamina a issue_refund, mientras que una petición de vale de tienda se encamina
+a issue_store_credit.
+
+
+------------------------------------------------------------------------------
+PASO 2 - BUCLE AGÉNTICO GOBERNADO POR stop_reason
+------------------------------------------------------------------------------
+Implementado en `run_agent`. Cada iteración llama a la Messages API y se
+ramifica según el stop_reason de la respuesta:
+
+  - stop_reason == "tool_use":
+        * El turno del asistente (que puede contener texto más uno O MÁS bloques
+          tool_use) se añade al historial de mensajes tal cual.
+        * Cada bloque tool_use en resp.content se ejecuta, y se produce un bloque
+          tool_result por llamada, emparejado por tool_use_id.
+        * Los bloques tool_result se añaden como un único turno de usuario y el
+          bucle continúa: se vuelve a llamar al modelo con los resultados.
+
+  - stop_reason == "end_turn":
+        * Los bloques de texto se concatenan y se devuelven como respuesta final;
+          el bucle termina.
+
+  - cualquier otro stop_reason (p. ej. "max_tokens"):
+        * Se trata defensivamente como una condición terminal.
+
+Una guarda max_iterations evita los bucles infinitos. Como el código itera
+sobre TODOS los bloques tool_use de un turno, el mismo bucle soporta de forma
+transparente los turnos con herramientas en paralelo/múltiples que surgen de
+peticiones con varias preocupaciones (Paso 5).
+
+
+------------------------------------------------------------------------------
+PASO 3 - RESPUESTAS DE ERROR ESTRUCTURADAS + MANEJO DIFERENCIADO
+------------------------------------------------------------------------------
+Toda herramienta devuelve un sobre (envelope) homogéneo:
+
+  Éxito:   { "ok": true,  "data": { ... } }
+  Fallo:   { "ok": false, "error": {
+                 "errorCategory": "transient" | "validation" | "permission",
+                 "isRetryable":   true | false,
+                 "description":   "<explicación legible por humanos>"
+             }}
+
+Las tres categorías se ejercitan mediante el backend simulado:
+  - transient  (isRetryable=true)  - p. ej. un timeout del servicio de pedidos.
+  - validation (isRetryable=false) - p. ej. order_id desconocido, amount <= 0,
+                                     amount mayor que el total del pedido.
+  - permission (isRetryable=false) - p. ej. un pedido no elegible para reembolso
+                                     a tarjeta.
+
+Manejo diferenciado (`execute_tool`):
+  - Los errores transient + reintentables se reintentan EN CÓDIGO (hasta
+    max_retries, con un pequeño backoff), de forma transparente para el modelo.
+    Para hacerlo observable, la primera llamada get_order_status de cada pedido
+    devuelve de forma determinista un timeout transitorio y el reintento tiene
+    éxito (busca [RETRY] en la traza).
+  - Los errores validation/permission NO se reintentan; se devuelven al modelo
+    como tool_result para que el agente pueda explicar la razón de negocio al
+    cliente en lenguaje natural.
+
+Esto separa la inestabilidad de infraestructura (reintentar) de los resultados
+de negocio (explicar) - el patrón central de fiabilidad del Dominio 5.
+
+Qué categorías se OBSERVAN en tiempo de ejecución: el reintento transitorio
+aparece en los casos de consulta de estado (la traza [RETRY]), y el error de
+permission lo ejercita directamente el caso de reembolso de A-2002 - un error
+de negocio no reintentable que el agente explica al cliente, que es la mitad
+"explicar errores de negocio al usuario" de este paso. La categoría validation
+(id desconocido, amount no positivo o por encima del total) es alcanzable
+mediante los experimentos listados en CÓMO EJECUTAR.
+
+
+------------------------------------------------------------------------------
+PASO 4 - HOOK PROGRAMÁTICO QUE IMPONE UNA REGLA DE NEGOCIO + ESCALADO
+------------------------------------------------------------------------------
+`enforce_business_rules(name, tool_input)` se ejecuta DENTRO de `execute_tool`,
+ANTES de que la función de la herramienta llegue a invocarse. Es el punto de
+interceptación.
+
+Regla impuesta: cualquier operación que mueva dinero (issue_refund o
+issue_store_credit) cuyo amount supere THRESHOLD (500 EUR) queda bloqueada.
+Cuando se dispara, el hook:
+  - NO ejecuta la herramienta subyacente (no se mueve dinero),
+  - abre un ticket de escalado vía el backend escalate_to_human,
+  - devuelve un resultado estructurado "escalated" (errorCategory=permission,
+    isRetryable=false) cuya description incluye el id del ticket.
+
+Como el resultado fluye de vuelta por el camino normal de tool_result, el modelo
+recibe el escalado como dato y lo explica al cliente - incluyendo el número de
+ticket y una declaración explícita de que no se movió dinero. La regla se impone
+de forma determinista en código, independientemente del juicio del modelo, que
+es el sentido de un guardarraíl programático.
+
+
+------------------------------------------------------------------------------
+PASO 5 - MENSAJE CON VARIAS PREOCUPACIONES: DESCOMPONER, MANEJAR, SINTETIZAR
+------------------------------------------------------------------------------
+La prueba de varias preocupaciones (la segunda de las cuatro ejecuciones en
+__main__) envía tres peticiones en un solo mensaje:
+  1. Un reembolso a tarjeta de 50 EUR para el pedido A-1001 (llegó dañado).
+  2. Una consulta de estado para el pedido A-2002.
+  3. Un reembolso a tarjeta de 800 EUR para el pedido A-3003.
+
+Comportamiento esperado, verificable en la traza:
+  - El agente DESCOMPONE el mensaje en tres preocupaciones.
+  - Preocupación 1 -> issue_refund tiene éxito (A-1001 es reembolsable, por
+    debajo del umbral).
+  - Preocupación 2 -> get_order_status tiene éxito (tras un reintento
+    transitorio).
+  - Preocupación 3 -> issue_refund por 800 EUR es interceptado por el hook (por
+    encima del umbral de 500 EUR), se abre un ticket y la operación se escala.
+  - El agente entonces SINTETIZA una única respuesta unificada que cubre los tres
+    resultados, distinguiendo claramente las acciones completadas de la escalada.
+
+El system prompt instruye explícitamente al agente para que descomponga las
+peticiones multiparte, maneje cada una por separado, distinga reembolso de
+crédito en tienda y comunique cualquier escalado con su número de ticket -
+reforzando el comportamiento de orquestación que persigue el ejercicio.
+
+
+------------------------------------------------------------------------------
+CASOS DE PRUEBA EJECUTADOS (__main__)
+------------------------------------------------------------------------------
+El script ejecuta CUATRO casos; juntos cubren las tres categorías de error y
+ambas direcciones del par de herramientas confundibles:
+
+  1. "What is the status of my order A-1001?"
+     -> get_order_status. Ejercita el error TRANSIENT + reintento en código
+        ([RETRY] en la traza), luego una respuesta normal end_turn.  (Pasos 2, 3)
+
+  2. Varias preocupaciones: reembolso 50 EUR (A-1001) + estado (A-2002) +
+     reembolso 800 EUR (A-3003) en un solo mensaje.
+     -> Descomposición en tres preocupaciones: un reembolso con éxito, una
+        consulta de estado (con reintento transitorio) y un reembolso de 800 EUR
+        bloqueado por el hook y escalado, luego una síntesis unificada.
+                                                            (Pasos 1, 2, 4, 5)
+
+  3. "I want a 60 EUR refund to my card for order A-2002."
+     -> issue_refund sobre un pedido no reembolsable: un error de PERMISSION
+        (isRetryable=false), NO reintentado, explicado al cliente en lenguaje
+        natural. La mitad "explicar errores de negocio" del Paso 3.     (Paso 3)
+
+  4. "I'll take a store voucher for 30 EUR on order A-1001 instead."
+     -> issue_store_credit: la OTRA dirección del par confundible; el modelo debe
+        elegir crédito en tienda sobre reembolso a partir del enunciado. Tiene
+        éxito (30 <= total del pedido, sin requisito de reembolsabilidad, por
+        debajo del umbral).                                             (Paso 1)
+
+Resumen de cobertura: transient (casos 1-2) y permission (caso 3) se observan en
+tiempo de ejecución; validation está disponible vía los experimentos de abajo.
+El par confundible se ejercita en ambas direcciones (reembolso en casos 2-3,
+crédito en tienda en caso 4).
+
+
+------------------------------------------------------------------------------
+CÓMO EJECUTAR
+------------------------------------------------------------------------------
+  1. Asegúrate de que ANTHROPIC_API_KEY esté definida en el entorno.
+  2. pip install anthropic
+  3. python cca_f_exercise_1.py
+
+La traza por consola imprime, para cada iteración: el stop_reason, cada llamada
+a herramienta y su resultado estructurado, cualquier evento [RETRY], [HOOK] y
+[ESCALATION], y la respuesta final sintetizada.
+
+Experimentos sugeridos:
+  - Pasa un order_id desconocido o un amount negativo/por encima del total para
+    observar la categoría VALIDATION (la única que las cuatro ejecuciones no
+    alcanzan ya).
+  - Cambia THRESHOLD para ver escalar operaciones distintas.
+  - Cambia MODEL a "claude-haiku-4-5-20251001" para reducir el coste por
+    ejecución.
+
+
+##############################################################################
+# EJERCICIO 2 - CONFIGURAR CLAUDE CODE PARA UN FLUJO DE TRABAJO DE EQUIPO
+##############################################################################
+
+Objetivo
+--------
+Configurar jerarquías de CLAUDE.md, comandos slash personalizados, reglas
+específicas por ruta, una skill con alcance de proyecto e integración de
+servidores MCP para un proyecto con varios desarrolladores.
+
+Todos los formatos siguientes se verificaron contra la documentación oficial de
+Claude Code (code.claude.com/docs) para el sistema de memoria, las skills y MCP.
+
+
+------------------------------------------------------------------------------
+ESTRUCTURA DE DIRECTORIOS A CREAR
+------------------------------------------------------------------------------
+Todo lo entregable vive en la RAÍZ DEL PROYECTO (versionado en git para que cada
+miembro del equipo lo comparta), excepto el servidor MCP personal, que es por
+usuario.
+
+  team-workflow/                         <- la raíz de tu proyecto (repo git)
+  |-- CLAUDE.md                          PASO 1  estándares de proyecto
+  |-- .mcp.json                          PASO 4  servidores MCP del equipo
+  |-- .env.example                       PASO 4  plantilla de credenciales (copiar a .env)
+  |-- user-scope-mcp.sample.json         PASO 4  muestra del servidor personal
+  |-- .claude/
+  |   |-- rules/
+  |   |   |-- api-conventions.md         PASO 2  regla por ruta (src/api)
+  |   |   `-- testing-conventions.md     PASO 2  regla por ruta (*.test.*)
+  |   |-- skills/
+  |   |   `-- coverage-audit/
+  |   |       `-- SKILL.md               PASO 3  skill bifurcada, con herramientas restringidas
+  |   `-- commands/
+  |       `-- review.md                  comando slash personalizado (/review)
+
+Crear las carpetas (ejecutar desde la raíz del proyecto):
+
+  Windows PowerShell:
+    mkdir .claude\rules, .claude\skills\coverage-audit, .claude\commands
+
+  macOS / Linux:
+    mkdir -p .claude/rules .claude/skills/coverage-audit .claude/commands
+
+El nombre de la carpeta de la skill DEBE coincidir con el campo `name` de la
+skill (coverage-audit).
+
+Entradas recomendadas en .gitignore (mantener los secretos fuera del control de
+versiones):
+    .env
+
+
+------------------------------------------------------------------------------
+PASO 1 - CLAUDE.md A NIVEL DE PROYECTO
+------------------------------------------------------------------------------
+Archivo: CLAUDE.md (raíz del proyecto)
+
+Contiene los estándares de código universales y las convenciones de testing:
+indentación, nomenclatura, manejo de errores, los frameworks de test (Jest /
+pytest), los comandos de ejecución antes del commit, el suelo de cobertura del
+80% y las convenciones de commit/PR. También actúa como índice que apunta a las
+reglas por ruta.
+
+Por qué es consistente en todo el equipo: los archivos en la jerarquía de
+directorios en o por encima del directorio de trabajo se cargan COMPLETOS al
+inicio de la sesión, para cada desarrollador que tenga el repo. Como CLAUDE.md
+está versionado en git, todos reciben las mismas instrucciones automáticamente;
+nadie tiene que configurar nada.
+
+Orden de carga (mayor prioridad primero): managed policy (a nivel de
+organización) > project (./CLAUDE.md) > user (~/.claude/CLAUDE.md). Las
+instrucciones más específicas ganan. Mantén el archivo conciso (por debajo de
+~200 líneas); si la ventana de contexto se llena, las instrucciones más antiguas
+se compactan primero.
+
+Verificar:
+  - Inicia `claude` en el proyecto y ejecuta `/memory` -> CLAUDE.md aparece como
+    cargado.
+  - Pregunta: "What are our testing conventions?" -> la respuesta refleja el
+    archivo.
+  - Un compañero que clona el repo ve el mismo comportamiento con cero
+    configuración.
+
+
+------------------------------------------------------------------------------
+PASO 2 - REGLAS POR RUTA EN .claude/rules/
+------------------------------------------------------------------------------
+Archivos: .claude/rules/api-conventions.md       (paths: "src/api/**/*")
+          .claude/rules/testing-conventions.md   (paths: "**/*.test.*")
+
+Cada archivo .md en .claude/rules/ se carga como memoria de proyecto. Añadir un
+campo de frontmatter `paths` (una lista YAML de patrones glob) acota la regla de
+modo que solo entra en contexto cuando Claude trabaja con un archivo que
+coincide. Una regla sin campo `paths` se carga de forma incondicional.
+
+DETALLES DE FORMATO IMPORTANTES (de lo contrario provocan fallos silenciosos):
+  - Cualquier glob que empiece por * o { DEBE entrecomillarse en YAML.
+    "**/*.test.*" rompería el frontmatter sin comillas. Ambos archivos de regla
+    entrecomillan sus patrones.
+  - Las reglas por ruta se disparan cuando Claude LEE un archivo que coincide, no
+    cuando CREA uno nuevo desde cero. Las obligaciones del momento de creación
+    pertenecen a CLAUDE.md.
+  - `paths` funciona en reglas a nivel de PROYECTO. A nivel de usuario
+    (~/.claude/rules/) se ignora actualmente (un bug conocido); mantén las
+    reglas por ruta en el proyecto.
+
+Verificar:
+  - Abre/edita un archivo bajo src/api/ y ejecuta `/memory` (o `/context`):
+    api-conventions queda cargada.
+  - Abre un archivo de test (foo.test.ts): testing-conventions se carga.
+  - Edita un archivo no relacionado (p. ej. README.md): no se carga ninguna de
+    las dos reglas por ruta.
+
+
+------------------------------------------------------------------------------
+PASO 3 - SKILL CON ALCANCE DE PROYECTO, context: fork Y allowed-tools
+------------------------------------------------------------------------------
+Archivo: .claude/skills/coverage-audit/SKILL.md
+
+La skill ejecuta una auditoría de cobertura de tests. Frontmatter clave:
+  - context: fork        Ejecuta la skill en un subagente AISLADO con su propia
+                         ventana de contexto. La salida verbosa de cobertura se
+                         queda en el subagente; solo vuelve un resumen conciso a
+                         la conversación principal, de modo que el contexto
+                         principal no se contamina.
+  - allowed-tools        Restringe la skill a inspección de solo lectura más el
+                         comando de test: Read, Grep, Glob, Bash(npm test:*). No
+                         puede escribir archivos ni ejecutar comandos shell
+                         arbitrarios.
+  - disable-model-invocation: true  Solo se ejecuta cuando tecleas
+                         /coverage-audit; el modelo no la auto-dispara.
+
+Nota de diseño: context: fork solo tiene sentido para una skill que contiene una
+TAREA real (esta ejecuta y parsea cobertura). Una skill que es solo directrices
+se bifurcaría en un subagente sin nada que hacer y no devolvería nada útil.
+
+Verificar:
+  - Ejecuta `/coverage-audit`. Observa que se genera un subagente, hace el
+    escaneo y devuelve solo la tabla resumen - el volcado completo de cobertura
+    nunca aterriza en tu conversación principal.
+  - Confirma que la skill no puede escribir (allowed-tools no tiene Write/Edit).
+
+
+------------------------------------------------------------------------------
+COMANDO SLASH PERSONALIZADO (objetivo: "comandos slash personalizados")
+------------------------------------------------------------------------------
+Archivo: .claude/commands/review.md  ->  invocado como /review
+
+Ejecuta la checklist de revisión del equipo contra el diff actual. Usa la
+sintaxis de inyección !`command` para insertar `git status` y `git diff HEAD` en
+el prompt antes de que Claude lo vea, y restringe las herramientas a lecturas de
+git más inspección de solo lectura. Nota: los comandos y las skills se han
+fusionado; un archivo de comando y una skill con el mismo nombre crean ambos el
+mismo comando slash, con las skills teniendo precedencia.
+
+Verificar:
+  - Haz un cambio pequeño, ejecuta `/review` y confirma que Claude revisa el diff
+    real y agrupa los hallazgos como Critical / Warning / Suggestion.
+
+
+------------------------------------------------------------------------------
+PASO 4 - SERVIDORES MCP: COMPARTIDO POR EQUIPO (.mcp.json) + PERSONAL (~/.claude.json)
+------------------------------------------------------------------------------
+Archivo: .mcp.json (raíz del proyecto, versionado)
+
+Define tres servidores de equipo y demuestra la expansión de variables de
+entorno en todas las ubicaciones soportadas (command, args, env, url, headers):
+  - github (http)       Authorization: Bearer ${GITHUB_TOKEN}
+  - internal-api (http) url usa ${INTERNAL_API_BASE_URL:-<default>}, token vía ${...}
+  - team-postgres (stdio) cadena de conexión vía ${DATABASE_URL}, ${PGAPPNAME:-...} en env
+
+Sintaxis de expansión:
+  ${VAR}            -> valor de VAR
+  ${VAR:-default}   -> VAR si está definida, en caso contrario el valor por defecto
+
+El archivo versionado lleva solo la FORMA; cada desarrollador aporta sus propios
+secretos vía variables de entorno, de modo que las credenciales nunca entran en
+git. Copia .env.example a .env y rellénalo (y exporta esas variables, p. ej. vía
+tu perfil de shell o un lanzador dotenv, antes de iniciar `claude`).
+
+ADVERTENCIA: una ${VAR} SIN valor por defecto que esté sin definir hace que
+Claude Code falle al parsear .mcp.json. Toda variable requerida debe estar
+presente, o darle un valor por defecto.
+
+Servidor experimental personal (alcance de usuario, almacenado en ~/.claude.json):
+NO edites a mano ~/.claude.json - es un archivo grande a nivel de máquina. Añade
+el servidor con la CLI, que lo escribe al alcance de usuario por ti:
+
+    claude mcp add --scope user experimental-everything \
+        -- npx -y @modelcontextprotocol/server-everything
+
+(user-scope-mcp.sample.json muestra la entrada exacta que esto produce, como
+referencia.)
+
+Alcances de MCP: local (por defecto) y user viven ambos en ~/.claude.json -
+local se indexa por la ruta del proyecto, user es global en todos tus proyectos.
+project vive en .mcp.json. Precedencia ante colisión de nombres:
+local > project > user.
+
+Verificar que ambos están disponibles simultáneamente:
+  - Ejecuta `claude mcp list` -> los tres servidores de proyecto Y
+    experimental-everything aparecen todos con health checks.
+  - Los servidores de proyecto de .mcp.json arrancan como "pending approval" la
+    primera vez; ejecuta `/mcp` dentro de una sesión para aprobarlos. `/mcp`
+    también gestiona OAuth y muestra el recuento de herramientas por servidor.
+
+
+------------------------------------------------------------------------------
+PASO 5 - PLAN MODE vs EJECUCIÓN DIRECTA (ejercicio de observación)
+------------------------------------------------------------------------------
+Entra en plan mode pulsando Shift+Tab para ciclar entre modos (o arranca con
+--permission-mode plan). En plan mode Claude investiga y propone un plan SIN
+editar archivos hasta que apruebas. Ejecuta cada tarea dos veces (plan vs
+directo) y observa:
+
+1. Corrección de bug en un solo archivo (baja complejidad)
+   - Directo: el camino más rápido; el cambio es pequeño y obvio, poco valor de
+     planificación.
+   - Plan: añade sobrecarga con poco beneficio.
+   - Observación: para correcciones localizadas e inequívocas, gana la ejecución
+     directa.
+
+2. Migración de librería multi-archivo (complejidad media/alta, baja ambigüedad)
+   - Directo: arriesgado - Claude puede editar archivos en un orden que deja el
+     repo roto a medio camino, o pasar por alto sitios de llamada.
+   - Plan: alto valor - ves la lista completa de archivos afectados y la
+     secuencia antes de que nada cambie, y puedes corregir el alcance por
+     adelantado.
+   - Observación: plan mode compensa cuando un cambio abarca muchos archivos
+     aunque la "respuesta correcta" sea clara, porque el orden y la completitud
+     importan.
+
+3. Nueva funcionalidad con varios enfoques válidos (alta ambigüedad)
+   - Directo: Claude se compromete con un diseño de inmediato; descubres el
+     enfoque elegido solo después de que el código existe.
+   - Plan: el valor más alto - comparas enfoques y eliges la arquitectura ANTES
+     de escribir código alguno, evitando trabajo desechable.
+   - Observación: plan mode es más valioso cuando el problema es abierto y varios
+     diseños compiten.
+
+Conclusión: el valor de plan mode crece con el radio de impacto (archivos
+tocados) y la ambigüedad (número de enfoques válidos). Usa ejecución directa
+para ediciones pequeñas y bien definidas; usa plan mode para trabajo de amplio
+alcance o a nivel de diseño. Los subagentes Explore y Plan saltan
+deliberadamente CLAUDE.md y git status para mantener su contexto ligero durante
+la investigación.
+
+
+------------------------------------------------------------------------------
+LISTA RÁPIDA DE VERIFICACIÓN
+------------------------------------------------------------------------------
+  [ ] /memory lista CLAUDE.md (y las reglas, cuando hay archivos coincidentes abiertos)
+  [ ] Editar src/api/* carga api-conventions; editar *.test.* carga testing-conventions
+  [ ] Editar un archivo no relacionado no carga ninguna regla por ruta
+  [ ] /coverage-audit corre en un subagente y devuelve solo un resumen
+  [ ] /review revisa el diff en vivo con herramientas restringidas
+  [ ] claude mcp list muestra los 3 servidores de proyecto + el servidor personal de usuario
+  [ ] /mcp aprueba los servidores de proyecto pendientes
+  [ ] Plan vs directo comparado en los tres tipos de tarea
+
+
+##############################################################################
+# EJERCICIO 3 - CONSTRUIR UNA TUBERÍA DE EXTRACCIÓN DE DATOS ESTRUCTURADOS
+##############################################################################
+
+Objetivo
+--------
+Diseñar esquemas JSON, usar tool_use para salida estructurada, implementar un
+bucle de validación-reintento, diseñar una estrategia de procesamiento por lotes
+y encaminar las extracciones de baja confianza a revisión humana.
+
+La superficie de la Message Batches API (create / retrieve / results, fallos por
+custom_id, polling, SLA de 24h) se verificó contra la documentación oficial de
+la Claude API.
+
+Tarea de extracción de dominio: extracción de metadatos bibliográficos de
+documentos de formatos variados. La tubería se construye sobre la Messages API
+en crudo con tool_use forzado como mecanismo de salida estructurada.
+
+
+------------------------------------------------------------------------------
+DISPOSICIÓN DEL PAQUETE
+------------------------------------------------------------------------------
+  extraction_pipeline/
+  |-- requirements.txt              anthropic>=0.40, pydantic>=2.6
+  |-- run_demo.py                   punto de entrada (demo de un doc + modo batch)
+  `-- extraction/
+      |-- __init__.py
+      |-- schema.py                 PASO 1 esquema de tool + PASO 2 Pydantic + clasificador de errores
+      |-- documents.py              docs de muestra de formato variado, etiquetas gold, generador de 100 docs
+      |-- fewshot.py                PASO 3 ejemplos few-shot
+      |-- extract.py                PASO 1/2/5 extracción de un doc + reintento + encaminamiento
+      |-- batch.py                  PASO 4 Batches API + manejo de fallos + troceado + SLA
+      `-- analysis.py               PASO 5 precisión por campo/tipo + resumen de encaminamiento
+
+Configuración y ejecución:
+  pip install -r requirements.txt
+  set ANTHROPIC_API_KEY=...                 (PowerShell: $env:ANTHROPIC_API_KEY="...")
+  python run_demo.py                        # Pasos 1,2,3,5 sobre 3 docs de muestra (barato)
+  python run_demo.py --batch                # Paso 4: construye payloads de 100 docs, sin enviar
+  python run_demo.py --batch --submit       # Paso 4: envía de verdad (cuesta dinero, asíncrono)
+
+
+------------------------------------------------------------------------------
+PASO 1 - ESQUEMA DE TOOL DE EXTRACCIÓN (required/optional/enum-other/nullable)
+------------------------------------------------------------------------------
+Archivo: schema.py (EXTRACTION_TOOL) + modelo Pydantic PublicationMetadata.
+
+La tool se fuerza vía tool_choice={"type":"tool","name":...}, de modo que el
+modelo debe devolver salida estructurada. Diseño de campos:
+  - Requerido, no anulable: title, authors, document_type, abstract_summary.
+  - Enum con "other" + patrón de detalle: document_type es un enum de seis
+    valores incluyendo "other"; document_type_detail lleva la descripción en
+    texto libre y debe ser no nulo SI Y SOLO SI document_type == "other".
+  - Campos anulables: publication_year, doi, funding_source, citation_count y
+    document_type_detail usan un tipo unión ["<type>", "null"].
+  - Campo opcional: keywords (el único campo NO incluido en `required`).
+
+DECISIÓN DE DISEÑO CLAVE (verificar null, no fabricación): cada campo anulable se
+lista en `required` pero se tipa para permitir null. Requerir la CLAVE mientras
+se permite un VALOR null obliga al modelo a emitir un null explícito cuando la
+información está ausente, en lugar de descartar silenciosamente el campo (que es
+donde se esconden la omisión/fabricación). El system prompt lo refuerza: "output
+null - never guess or fabricate." Los documentos de muestra en documents.py
+omiten deliberadamente DOI, financiación y recuentos de citas para que puedas
+confirmar que el modelo devuelve null para ellos.
+
+
+------------------------------------------------------------------------------
+PASO 2 - BUCLE DE VALIDACIÓN-REINTENTO (resoluble vs no resoluble)
+------------------------------------------------------------------------------
+Archivos: extract.py (extract_document) + schema.py (classify_validation_error).
+
+Tras cada tool_use forzado, la entrada en crudo se valida con Pydantic. Ante un
+fallo:
+  1. El error se clasifica (classify_validation_error):
+     - RESOLUBLE (formato/lógica): enum/literal erróneo, parseo de tipo, una
+       clave que debería ser null pero se omitió (`missing`), confianza fuera de
+       rango y la regla custom other/detail (`value_error`). Son problemas de
+       forma que el modelo puede arreglar en un reintento.
+     - NO RESOLUBLE: cualquier error fuera de ese conjunto - p. ej. un campo
+       requerido y no anulable que no puede poblarse porque la información está
+       genuinamente ausente.
+  2. Si es resoluble y quedan reintentos, se envía un seguimiento correctivo.
+     Mantiene el documento en el historial, añade el tool_use del asistente que
+     falló, luego añade un tool_result de usuario (is_error=true) que contiene
+     los errores de validación EXACTOS y una nueva petición. La tool se fuerza de
+     nuevo, de modo que el modelo devuelve un tool_use corregido.
+  3. Si no es resoluble, el bucle se detiene de inmediato y encamina a revisión
+     humana (sin bucles inútiles). Si se agotan los reintentos, mismo desenlace.
+
+Seguimiento: ExtractionResult.resolved_by_retry registra si un reintento
+recuperó un fallo anterior; error_history registra la clasificación por intento,
+de modo que puedes informar qué clases de error se arreglaron por reintento
+frente a cuáles no.
+
+
+------------------------------------------------------------------------------
+PASO 3 - EJEMPLOS FEW-SHOT PARA VARIEDAD ESTRUCTURAL
+------------------------------------------------------------------------------
+Archivo: fewshot.py.
+
+Dos pares de ejemplo (documento -> tool_use ideal) de FORMAS DIFERENTES:
+  - Ejemplo 1: prosa narrativa con citas en línea; DOI y financiación ausentes
+    (modelando nulls explícitos).
+  - Ejemplo 2: una bibliografía/tabla estructurada para un tipo inusual, mapeando
+    a document_type == "other" CON un document_type_detail.
+Estos enseñan al modelo a manejar prosa con citas en línea frente a registros
+estructurados/tabulares, y a aplicar los comportamientos de null y other/detail
+de forma consistente.
+
+Detalle de disposición (fiabilidad): los turnos few-shot se ordenan de modo que,
+una vez añadido el documento real, la conversación mantiene una alternancia
+ESTRICTA usuario/asistente - user(DOC1) -> assistant(ex1) -> user[tool_result +
+DOC2] -> assistant(ex2) -> user[tool_result + REAL_DOC]. Cada tool_result
+referencia el tool_use_id del turno de asistente inmediatamente anterior. Esto
+evita secuencias de mensaje malformadas.
+
+
+------------------------------------------------------------------------------
+PASO 4 - ESTRATEGIA DE PROCESAMIENTO POR LOTES (Message Batches API)
+------------------------------------------------------------------------------
+Archivo: batch.py.
+
+  - Construir: build_request() convierte cada documento en {custom_id, params},
+    donde params tiene la misma forma que una llamada messages.create() (model,
+    max_tokens, system, tools, tool_choice, messages). make_documents(100)
+    construye el lote; custom_id es el id del documento, de modo que los
+    resultados se reconcilian limpiamente.
+  - Enviar + poll: submit_and_wait() llama a client.messages.batches.create(),
+    luego sondea client.messages.batches.retrieve() hasta que
+    processing_status == "ended" (no existen webhooks; el polling cada ~30s es el
+    patrón estándar).
+  - Recolectar por custom_id: se itera client.messages.batches.results(); el
+    result.type de cada entrada es succeeded | errored | expired | canceled. Los
+    mensajes succeeded se parsean en busca del bloque tool_use y se validan con
+    Pydantic; lo que falla localmente va a `invalid`, los fallos de API van a
+    `failed`.
+  - Manejar fallos por custom_id + reenviar con modificaciones: resubmit_failed()
+    trocea los documentos demasiado grandes (el generador planta un doc de
+    ~60k caracteres para disparar esto) en varias peticiones de troceo (custom_id
+    "id#chunkN"), luego fusiona las extracciones por troceo de vuelta bajo el id
+    original (primer escalar no nulo, unión de campos de lista, máxima confianza
+    por campo) y revalida.
+  - SLA: se mide el tiempo de reloj transcurrido y se compara con dos cotas - el
+    techo duro de 24h de la API (SLA_HARD_SECONDS) y un objetivo interno más
+    estricto (SLA_TARGET_SECONDS = 1h). Se informan los flags within_target /
+    within_hard_sla.
+
+Notas de coste/rendimiento para el examen: los lotes corren al 50% del precio
+estándar por token; un lote contiene hasta 100.000 peticiones (o 256MB); los
+resultados permanecen recuperables durante 29 días; la mayoría de los lotes
+terminan muy por debajo de una hora pero el SLA garantizado es de 24h. El modelo
+por defecto es Haiku aquí porque el trabajo es masivo y no interactivo.
+
+Seguridad: run_batch(submit=False) construye y valida todos los payloads SIN
+llamada de red alguna; submit=True es necesario para crear de verdad el lote.
+
+
+------------------------------------------------------------------------------
+PASO 5 - ENCAMINAMIENTO A REVISIÓN HUMANA + ANÁLISIS DE PRECISIÓN
+------------------------------------------------------------------------------
+Archivos: extract.py (_confidence_routing) + analysis.py.
+
+  - Confianza a nivel de campo: el esquema de la tool incluye field_confidence
+    (una puntuación 0..1 por campo de datos); el system prompt pide puntuaciones
+    CALIBRADAS (alta cuando es literal, baja cuando es interpretada).
+  - Encaminamiento: cualquier extracción cuyos campos REQUERIDOS (title, authors,
+    document_type, abstract_summary) puntúen por debajo de CONFIDENCE_THRESHOLD
+    (0.70) se marca needs_human_review con razones explícitas. routing_summary()
+    agrega la tasa de revisión y muestra ejemplos.
+  - Precisión por tipo de documento y campo: accuracy_report() compara las
+    extracciones validadas con las etiquetas gold y produce precisión por campo Y
+    precisión por tipo de documento, más un "consistency_spread" (máximo menos
+    mínimo de precisión entre tipos) - un spread pequeño significa rendimiento
+    consistente entre formatos, que es exactamente lo que el paso pide verificar.
+    abstract_summary es texto libre y se excluye intencionadamente de la
+    puntuación por coincidencia exacta.
+
+
+------------------------------------------------------------------------------
+QUÉ DEMUESTRA CADA EJECUCIÓN
+------------------------------------------------------------------------------
+  python run_demo.py
+    - Extrae los 3 docs de muestra, muestra nulls explícitos para campos ausentes
+      (Paso 1), cualquier reintento de validación y si se resolvieron (Paso 2), la
+      generalización few-shot entre formatos (Paso 3), el resumen de
+      encaminamiento y la tabla de precisión por campo/tipo (Paso 5).
+  python run_demo.py --batch
+    - Construye 100 payloads de petición y marca el documento sobredimensionado
+      plantado, sin gastar nada (estructura del Paso 4).
+  python run_demo.py --batch --submit
+    - Envía el lote real, sondea, maneja fallos por custom_id, reenvía el doc
+      sobredimensionado como troceos, fusiona e imprime el tiempo transcurrido
+      frente al SLA (Paso 4).
+
+
+------------------------------------------------------------------------------
+NOTAS DE FIABILIDAD / DISEÑO QUE MERECE ARTICULAR
+------------------------------------------------------------------------------
+  - "Requerido + anulable" es la palanca anti-fabricación: fuerza nulls
+    explícitos.
+  - Distinguir CLASES de error: el reintento solo arregla problemas de
+    forma/formato; la información ausente es una decisión de encaminamiento, no
+    un objetivo de reintento - hacer bucle sobre ella desperdicia tokens y nunca
+    converge.
+  - custom_id es la columna vertebral de la fiabilidad del lote: es cómo
+    reconcilias resultados, identificas fallos y reensamblas reenvíos troceados.
+  - No hay webhooks de lote - el polling es la única señal de completitud, y los
+    resultados expiran tras 29 días, así que persístelos puntualmente.
+  - La confianza solo es útil si está calibrada; encaminar sobre puntuaciones no
+    calibradas mueve el trabajo equivocado a los humanos. El análisis de precisión
+    por campo/tipo es cómo compruebas que esa calibración y consistencia se
+    cumplen de verdad.
+
+
+##############################################################################
+# EJERCICIO 4 - DISEÑAR Y DEPURAR UNA TUBERÍA DE INVESTIGACIÓN MULTIAGENTE
+# (VERSIÓN CLAUDE AGENT SDK)
+##############################################################################
+
+Implementación de referencia: cca_f_exercise_4_agentsdk.py
+SDK: claude-agent-sdk 0.2.107 (verificado: todos los símbolos y campos de
+dataclass usados aquí importan y se construyen limpiamente contra esta versión)
+
+
+------------------------------------------------------------------------------
+1. OBJETIVO Y POR QUÉ EL AGENT SDK
+------------------------------------------------------------------------------
+Objetivo: orquestar subagentes, gestionar el paso de contexto, propagar errores
+y sintetizar hallazgos con seguimiento de procedencia.
+
+Esta versión se construye sobre el Claude Agent SDK en lugar de la Messages API
+en crudo. El Dominio 1 (Arquitectura Agéntica y Orquestación) nombra el Agent SDK
+directamente - definiciones de agente, bucles agénticos, generación de
+subagentes vía la tool Task, configuración de allowedTools y orquestación
+multiagente coordinador-subagente - y la guía de preparación del examen
+recomienda construir un agente con él de extremo a extremo. El texto del
+ejercicio está escrito desde dentro de ese mundo: términos como "coordinator
+agent", "subagents", "parallel subagent execution", y especialmente la
+advertencia de pasar los hallazgos "directly in its prompt rather than relying on
+automatic context inheritance" solo tienen sentido cuando se asume un framework
+de subagentes que PODRÍA heredar contexto. El Agent SDK es ese framework, así que
+es el objetivo fiel de este ejercicio.
+
+Cambio conceptual clave respecto a la versión en crudo: NO escribes el bucle
+agéntico ni una tool Task personalizada. El SDK posee el bucle, la generación de
+subagentes y el paralelismo. Tú DEFINES los agentes y CONFIGURAS la orquestación;
+el SDK la ejecuta. Este informe mapea cada uno de los cinco pasos al primitivo
+del SDK que lo implementa, y es explícito sobre el único punto (Paso 4) donde el
+SDK te da menos control directo que la versión en crudo.
+
+
+------------------------------------------------------------------------------
+2. ARQUITECTURA DE UN VISTAZO
+------------------------------------------------------------------------------
+  Coordinador (ClaudeSDKClient + ClaudeAgentOptions)
+    |  system prompt: solo delega; genera ángulos de investigación en paralelo;
+    |  pasa a cada subagente todo lo que necesita; luego genera el sintetizador;
+    |  procede con resultados parciales y señala lagunas de cobertura.
+    |  allowed_tools = ["Agent", "Task", "WebSearch"]
+    |
+    |-- genera --> web-researcher   (AgentDefinition, tools=["WebSearch"])
+    |-- genera --> doc-analyst      (AgentDefinition, tools=[]; razona sobre texto)
+    `-- genera --> synthesizer      (AgentDefinition, tools=[])
+
+  Hooks: SubagentStart / SubagentStop  -> observan la generación y la finalización.
+
+Tres subagentes (el ejercicio requiere al menos dos subagentes de investigación;
+el sintetizador es el tercero). Cada AgentDefinition lleva su propia description,
+system prompt, lista de tools y modelo. Los subagentes de investigación usan el
+modelo barato/rápido; el coordinador usa un modelo más potente para la
+descomposición y la orquestación.
+
+
+------------------------------------------------------------------------------
+3. MAPEO PASO A PASO AL SDK
+------------------------------------------------------------------------------
+
+PASO 1 - El coordinador delega a subagentes; allowed_tools incluye la tool de generación
+  - Los subagentes se declaran programáticamente en la opción `agents` como un
+    dict de name -> AgentDefinition(description, prompt, tools, model). Este es el
+    mecanismo nativo de subagentes del SDK.
+  - El coordinador los genera a través de la tool de generación integrada.
+    allowed_tools lista TANTO "Agent" (el nombre que usa el SDK de Python actual)
+    como "Task" (el nombre de Claude Code) para que el ejemplo sea robusto entre
+    builds del SDK; listar una tool en allowed_tools la pre-aprueba de modo que la
+    generación corre sin un prompt de permiso.
+  - El propio system prompt del coordinador le prohíbe investigar directamente -
+    solo delega - que es lo que lo convierte en un coordinador en lugar de un
+    agente que lo hace todo.
+  - SIN herencia automática de contexto: los subagentes del SDK arrancan con una
+    ventana de contexto EN BLANCO. No pueden ver la conversación del coordinador.
+    Por tanto, el system prompt del coordinador le instruye a poner todo lo que
+    cada subagente necesita en el prompt de generación - la pregunta para todos
+    ellos, y para doc-analyst el texto fuente COMPLETO de cada documento. Este es
+    el requisito explícito del ejercicio ("directly in its prompt rather than
+    relying on automatic context inheritance"), y con el SDK lo impone el modelo
+    de aislamiento en lugar de la convención.
+
+PASO 2 - Ejecución paralela de subagentes
+  - El system prompt del coordinador le dice que genere los ángulos de
+    investigación independientes JUNTOS, en un solo paso, de modo que el SDK los
+    corra concurrentemente en lugar de uno tras otro.
+  - Los hooks SubagentStart y SubagentStop imprimen cada generación y
+    finalización, de modo que el fan-out paralelo es observable en tiempo de
+    ejecución (ves varias líneas SubagentStart antes de las correspondientes
+    líneas SubagentStop).
+  - Nota sobre medición: la versión de la Messages API en crudo mide una
+    aceleración concreta paralelo-vs-secuencial porque posee el bucle de
+    despacho y puede cronometrar ambos caminos sobre el mismo trabajo. Con el SDK
+    el planificador corre los subagentes por ti, así que el paralelismo se
+    demuestra y observa vía los hooks en lugar de micro-benchmarkearse. Si la
+    respuesta del examen necesita un número de aceleración medido, cita la versión
+    en crudo; si necesita el patrón nativo de generación paralela, este es.
+
+PASO 3 - Hallazgos estructurados (contenido vs metadatos) + síntesis que preserva atribución
+  - El prompt de cada subagente de investigación le instruye a reportar cada
+    hallazgo como CLAIM / EVIDENCE / SOURCE / DATE - separando el contenido
+    (claim) de los metadatos (extracto de evidencia, nombre/URL de fuente, fecha)
+    - y a nunca fabricar una fuente.
+  - El prompt del sintetizador le exige conservar toda atribución de fuente cuando
+    combina hallazgos, de modo que la procedencia se preserva a través de la
+    fusión en lugar de colapsarse en prosa sin atribuir.
+
+PASO 4 - Propagación de errores (y una limitación honesta)
+  - El hook SubagentStop observa la finalización de cada subagente, incluyendo los
+    fallos, dando al coordinador visibilidad sobre qué devolvió y qué no.
+  - El system prompt del coordinador le instruye a proceder con resultados
+    PARCIALES cuando un subagente falla o no devuelve nada, y a decirle al
+    sintetizador qué ángulo falta para que se convierta en una laguna de cobertura
+    en el informe final.
+  - LIMITACIÓN, dicha con claridad: un timeout DETERMINISTA con resultados
+    parciales inyectados y un objeto de error totalmente estructurado
+    (failure_type, attempted_query, partial_results) es donde la versión de la
+    Messages API en crudo es más fuerte, porque posee el bucle de despacho e
+    impone el plazo ella misma. El SDK gestiona el bucle de subagentes por ti, así
+    que el control fino del timeout y de los resultados parciales es menos directo
+    aquí. Encuadre recomendado para el examen: presenta esta versión del SDK por
+    la orquestación nativa, y usa la versión en crudo para demostrar la
+    propagación de errores estructurada del Paso 4 con precisión. Ser capaz de
+    articular esa disyuntiva es en sí mismo una competencia del Dominio 1.
+
+PASO 5 - Fuentes en conflicto: conservar ambas, separar establecido vs disputado
+  - Se entregan al doc-analyst dos fuentes creíbles pero en conflicto en el prompt
+    del coordinador: WHO Report 2023 (4.2%) y OECD Brief 2023 (5.1%). Ambas
+    coinciden en que la tendencia es creciente; difieren en la cifra principal.
+  - El prompt del sintetizador le prohíbe elegir o promediar valores en conflicto.
+    Debe colocar la afirmación compartida de tendencia creciente bajo ESTABLISHED
+    (con ambas fuentes de apoyo) y las dos cifras distintas bajo CONTESTED, cada
+    valor conservado con su propia atribución de fuente, y terminar con COVERAGE
+    GAPS para lo que la investigación no pudo cubrir.
+
+
+------------------------------------------------------------------------------
+4. PRIMITIVOS DEL SDK USADOS (referencia rápida)
+------------------------------------------------------------------------------
+  ClaudeSDKClient            corre el bucle del agente; se usa como gestor de contexto asíncrono
+  ClaudeAgentOptions         configura model, system_prompt, agents, allowed_tools, hooks
+  AgentDefinition            declara un subagente (description, prompt, tools, model)
+  agents={...}               registra subagentes, generables vía la tool Agent/Task
+  allowed_tools=[...]        pre-aprueba la tool de generación y WebSearch
+  HookMatcher                vincula callbacks a eventos; aquí SubagentStart / SubagentStop
+  receive_response()         se itera de forma asíncrona para leer AssistantMessage / ResultMessage
+
+
+------------------------------------------------------------------------------
+5. EL MATIZ DE NOMENCLATURA Agent vs Task
+------------------------------------------------------------------------------
+El ejercicio (y Claude Code) llaman "Task" a la tool de generación de subagentes.
+El Agent SDK de Python actual genera los subagentes declarados en `agents` a
+través de una tool integrada llamada "Agent". Son el mismo concepto - un agente
+padre que lanza un agente hijo que corre en su propio contexto e informa de
+vuelta. Este archivo incluye ambos nombres en la lista de permitidos para que
+funcione independientemente de cuál exponga el build del SDK instalado. Útil
+saberlo para el examen: si una pregunta dice "Task tool" y tu SDK usa "Agent", se
+refieren al mismo primitivo de generación.
+
+
+------------------------------------------------------------------------------
+6. REQUISITOS PREVIOS Y CÓMO EJECUTAR
+------------------------------------------------------------------------------
+  1. Node.js instalado (el SDK ejecuta a través de la CLI de Claude Code incluida).
+  2. pip install claude-agent-sdk
+  3. Autenticar: define ANTHROPIC_API_KEY en el entorno (o usa una suscripción de
+     Claude autenticada que la CLI pueda recoger).
+  4. python cca_f_exercise_4_agentsdk.py
+
+Este archivo NO se ejecutó durante la preparación porque el SDK requiere la CLI +
+Node + autenticación; se validó estáticamente (importa y se construye limpiamente
+contra claude-agent-sdk 0.2.107). Ejecútalo una vez tú mismo y captura la traza
+como evidencia, como con los demás ejercicios.
+
+Qué buscar en la salida:
+  - Múltiples líneas [SubagentStart] apareciendo juntas  -> generación paralela (Paso 2).
+  - Líneas [SPAWN] Agent/Task ...                         -> el coordinador delegando (Paso 1).
+  - Texto de subagente con formato CLAIM / EVIDENCE / SOURCE / DATE -> hallazgos estructurados (Paso 3).
+  - Un informe final con ESTABLISHED (tendencia creciente, ambas fuentes) y
+    CONTESTED (4.2% WHO vs 5.1% OECD, ambas atribuidas) + COVERAGE GAPS -> Pasos 4 y 5.
+
+
+------------------------------------------------------------------------------
+7. MESSAGES API EN CRUDO vs AGENT SDK - POR QUÉ ESTE EJERCICIO ENCAJA CON EL SDK
+------------------------------------------------------------------------------
+  - El ejercicio nombra patrones de coordinador/subagente/paralelo y advierte
+    sobre la herencia automática de contexto - vocabulario que vive en el mundo
+    del Agent SDK. Así que el SDK es la implementación fiel y preferida, y es lo
+    que el Dominio 1 espera que seas capaz de construir.
+  - NO es estrictamente obligatorio: la misma arquitectura es implementable sobre
+    la Messages API en crudo (la versión en crudo compañera hace exactamente eso y
+    cumple los cinco pasos), y dos pasos - aceleración paralela medida y contexto
+    de error con timeout/resultados parciales determinista - salen más limpios
+    allí porque posees el bucle.
+  - La forma limpia de sostener ambas: el SDK te da los primitivos nativos de
+    orquestación (AgentDefinition, la tool Agent/Task, allowed_tools, hooks de
+    ciclo de vida); la versión en crudo te da control total para medir y depurar.
+    El hook que era una llamada a función dentro de un ejecutor (crudo) se
+    convierte en un hook de ciclo de vida (SDK); la tool Task personalizada +
+    despacho de hilos (crudo) se convierte en AgentDefinition + la tool Agent/Task
+    (SDK). Misma arquitectura, dos altitudes.
+
+
+##############################################################################
+# CIERRE - HILOS COMUNES ENTRE LOS CUATRO EJERCICIOS
+##############################################################################
+
+  - Dominio 1 (Arquitectura Agéntica y Orquestación): el Ejercicio 1 implementa
+    el bucle agéntico de forma explícita sobre la Messages API; el Ejercicio 4 lo
+    eleva al Agent SDK con orquestación multiagente. Saber moverse entre ambas
+    "altitudes" es la competencia central.
+
+  - Dominio 2 (Diseño de Herramientas e Integración MCP): el Ejercicio 1
+    demuestra descripciones de herramienta diferenciadas y el par confundible; el
+    Ejercicio 2 configura servidores MCP de equipo y personales con expansión de
+    variables de entorno.
+
+  - Dominio 3 (Configuración y Flujos de Trabajo de Claude Code): el Ejercicio 2
+    cubre jerarquías de CLAUDE.md, reglas por ruta, skills bifurcadas, comandos
+    slash y el contraste plan mode vs ejecución directa.
+
+  - Dominio 4 (Ingeniería de Prompts y Salida Estructurada): el Ejercicio 3 fuerza
+    tool_use, diseña esquemas con la palanca "requerido + anulable" y usa few-shot
+    para variedad estructural.
+
+  - Dominio 5 (Gestión de Contexto y Fiabilidad): atraviesa los Ejercicios 1, 3 y
+    4 - manejo de errores diferenciado por clase, bucles de validación-reintento,
+    encaminamiento a revisión humana, fiabilidad por custom_id en lotes y
+    propagación de errores con procedencia.
+
+Decisión recurrente de implementación: tres de los cuatro ejercicios se
+construyen sobre la Messages API en crudo (Ejercicios 1 y 3) o eligen
+conscientemente entre crudo y SDK (Ejercicio 4) para tener control explícito
+sobre el bucle, la medición y la depuración - mientras que el Ejercicio 2 opera
+enteramente dentro de la configuración de Claude Code. Articular cuándo una capa
+de abstracción ayuda y cuándo estorba es una habilidad transversal del examen.
+
+==============================================================================
+Fin del informe unificado.
+==============================================================================

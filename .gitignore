@@ -1,0 +1,30 @@
+# --- Secretos y entorno (NUNCA subir) ---
+.env
+.env.*
+!.env.example
+*.key
+secrets.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Salidas de ejecución / artefactos ---
+*.log
+batch_payloads/
+outputs/
+.DS_Store
+
+# --- Editores ---
+.idea/
+*.swp
+.vscode/*
+!.vscode/settings.json

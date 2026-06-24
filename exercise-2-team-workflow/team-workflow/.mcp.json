@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_TOKEN}"
+      }
+    },
+    "internal-api": {
+      "type": "http",
+      "url": "${INTERNAL_API_BASE_URL:-https://api.internal.example.com}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${INTERNAL_API_TOKEN}"
+      }
+    },
+    "team-postgres": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres", "${DATABASE_URL}"],
+      "env": {
+        "PGAPPNAME": "${PGAPPNAME:-claude-code}"
+      }
+    }
+  }
+}
