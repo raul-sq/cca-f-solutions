@@ -24,10 +24,13 @@ How it maps to the exercise:
            values with attribution and split established vs contested.
 
 Prerequisites:
-  pip install claude-agent-sdk      (bundles the Claude Code CLI; needs Node)
-  Authentication: ANTHROPIC_API_KEY in the environment (or a Claude subscription).
+  npm install -g @anthropic-ai/claude-code   (the Claude Code CLI; requires Node.js)
+  pip install claude-agent-sdk               (the Python SDK; it drives the CLI above)
+  Authentication: run `claude login` to use a Claude subscription (recommended for
+  local use; consumption goes to your plan). Alternatively set ANTHROPIC_API_KEY,
+  which takes precedence over the subscription login if both are present.
 Run:
-  python cca_f_exercise_4_agentsdk.py
+  py cca_f_exercise_4_agentsdk.py
 """
 
 from __future__ import annotations
