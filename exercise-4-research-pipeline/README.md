@@ -53,3 +53,11 @@ consumo a la cuenta de API.
 > explícitamente, atribución por fuente, propagación del subagente sin datos como
 > laguna de cobertura, y las dos cifras en conflicto (WHO 4,2 % / OECD 5,1 %)
 > mantenidas ambas bajo *en disputa*, sin elegir ni promediar.
+
+Ejecutado varias veces con resultados consistentes: como el modelo no es
+determinista, la redacción del informe varía entre ejecuciones, pero la estructura de
+fondo se mantiene estable — las dos cifras divergentes siempre acaban bajo
+*en disputa* (nunca promediadas ni descartadas) y la afirmación cualitativa
+compartida (la tendencia al alza) bajo *establecido*. Esa estabilidad de la
+separación establecido/disputado pese a la variación de redacción es justo la
+señal de robustez que el Paso 5 busca.
