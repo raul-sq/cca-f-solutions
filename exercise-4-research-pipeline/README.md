@@ -27,12 +27,29 @@ D2 (diseño de herramientas e integración MCP) · D5 (gestión de contexto y fi
   coordinador continúa con resultados parciales y anota las lagunas de cobertura.
 - Dos fuentes creíbles pero **en conflicto**: el sintetizador mantiene ambos
   valores con su fuente (sin elegir ni promediar) y separa lo *establecido* de lo
-  *contestado*.
+  *en disputa*.
 
 ## Cómo ejecutarlo
 
-```bash
-pip install claude-agent-sdk        # incluye la CLI de Claude Code; requiere Node.js
-export ANTHROPIC_API_KEY=...        # PowerShell: $env:ANTHROPIC_API_KEY="..."
-python cca_f_exercise_4_agentsdk.py
+Requiere **Node.js 18+** y la CLI de Claude Code, que el SDK de Python necesita
+por debajo:
+
+```powershell
+npm install -g @anthropic-ai/claude-code   # la CLI (requiere Node.js)
+py -m pip install claude-agent-sdk
+claude login                               # iniciar sesión con la suscripción (Max/Pro)
+py cca_f_exercise_4_agentsdk.py
 ```
+
+La autenticación recomendada para uso local es el `claude login` con tu cuenta de
+suscripción: así el consumo sale de tu plan. Si `ANTHROPIC_API_KEY` está definida
+en el entorno, tiene prioridad sobre el login de suscripción, así que para usar el
+plan conviene que no esté puesta (`$env:ANTHROPIC_API_KEY = $null` en esa sesión
+de PowerShell). De forma alternativa, exportar `ANTHROPIC_API_KEY` factura el
+consumo a la cuenta de API.
+
+> Verificado en local (Windows, PowerShell): los cinco pasos del ejercicio se
+> demuestran en una sola ejecución — *spawn* en paralelo, contexto pasado
+> explícitamente, atribución por fuente, propagación del subagente sin datos como
+> laguna de cobertura, y las dos cifras en conflicto (WHO 4,2 % / OECD 5,1 %)
+> mantenidas ambas bajo *en disputa*, sin elegir ni promediar.
