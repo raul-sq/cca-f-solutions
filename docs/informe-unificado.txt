@@ -9,7 +9,9 @@ Resumen general
 Este documento reúne en un solo informe la implementación de los cuatro
 ejercicios propuestos por la guía oficial de preparación. Cada ejercicio se
 construyó como una implementación ejecutable y se verificó contra la
-documentación oficial vigente (Claude API docs y code.claude.com/docs).
+documentación oficial vigente (Claude API docs y code.claude.com/docs). Además,
+los cuatro se ejecutaron y verificaron en local (Windows, PowerShell): cada
+sección incluye un apartado de verificación con los resultados observados.
 
 Índice de ejercicios y dominios reforzados:
 
@@ -246,9 +248,10 @@ crédito en tienda en caso 4).
 ------------------------------------------------------------------------------
 CÓMO EJECUTAR
 ------------------------------------------------------------------------------
-  1. Asegúrate de que ANTHROPIC_API_KEY esté definida en el entorno.
-  2. pip install anthropic
-  3. python cca_f_exercise_1.py
+  1. Asegúrate de que ANTHROPIC_API_KEY esté definida en el entorno
+     (se factura a la cuenta de API).
+  2. py -m pip install anthropic
+  3. py cca_f_exercise_1.py
 
 La traza por consola imprime, para cada iteración: el stop_reason, cada llamada
 a herramienta y su resultado estructurado, cualquier evento [RETRY], [HOOK] y
@@ -261,6 +264,19 @@ Experimentos sugeridos:
   - Cambia THRESHOLD para ver escalar operaciones distintas.
   - Cambia MODEL a "claude-haiku-4-5-20251001" para reducir el coste por
     ejecución.
+
+------------------------------------------------------------------------------
+VERIFICADO EN LOCAL
+------------------------------------------------------------------------------
+Ejecutado en Windows (PowerShell). Una sola ejecución demuestra los cinco pasos:
+el bucle alterna stop_reason tool_use / end_turn (Paso 2); un error transient en
+get_order_status se reintenta hasta resolverse mientras que un permission con
+isRetryable:false NO se reintenta (Paso 3); un reembolso de 800 EUR se intercepta
+por superar el umbral de 500 EUR, abre ticket y confirma que no se ha movido
+dinero (Paso 4); un mensaje con tres asuntos se resuelve en una pasada con
+respuesta unificada (Paso 5); y, al no ser elegible el reembolso a tarjeta, el
+agente cambia a issue_store_credit, distinguiendo las dos herramientas similares
+(Paso 1).
 
 
 ##############################################################################
@@ -559,11 +575,11 @@ DISPOSICIÓN DEL PAQUETE
       `-- analysis.py               PASO 5 precisión por campo/tipo + resumen de encaminamiento
 
 Configuración y ejecución:
-  pip install -r requirements.txt
-  set ANTHROPIC_API_KEY=...                 (PowerShell: $env:ANTHROPIC_API_KEY="...")
-  python run_demo.py                        # Pasos 1,2,3,5 sobre 3 docs de muestra (barato)
-  python run_demo.py --batch                # Paso 4: construye payloads de 100 docs, sin enviar
-  python run_demo.py --batch --submit       # Paso 4: envía de verdad (cuesta dinero, asíncrono)
+  py -m pip install -r requirements.txt
+  $env:ANTHROPIC_API_KEY = "sk-ant-..."     (se factura a la cuenta de API)
+  py run_demo.py                        # Pasos 1,2,3,5 sobre 3 docs de muestra (barato)
+  py run_demo.py --batch                # Paso 4: construye payloads de 100 docs, sin enviar
+  py run_demo.py --batch --submit       # Paso 4: envía de verdad (cuesta dinero, asíncrono)
 
 
 ------------------------------------------------------------------------------
@@ -706,16 +722,20 @@ Archivos: extract.py (_confidence_routing) + analysis.py.
 ------------------------------------------------------------------------------
 QUÉ DEMUESTRA CADA EJECUCIÓN
 ------------------------------------------------------------------------------
-  python run_demo.py
+Autenticación: usa el SDK `anthropic` y la Message Batches API, así que se factura
+a la cuenta de API (necesita ANTHROPIC_API_KEY; no usa la suscripción Max).
+
+  py run_demo.py
     - Extrae los 3 docs de muestra, muestra nulls explícitos para campos ausentes
       (Paso 1), cualquier reintento de validación y si se resolvieron (Paso 2), la
       generalización few-shot entre formatos (Paso 3), el resumen de
       encaminamiento y la tabla de precisión por campo/tipo (Paso 5).
-  python run_demo.py --batch
+  py run_demo.py --batch
     - Construye 100 payloads de petición y marca el documento sobredimensionado
       plantado, sin gastar nada (estructura del Paso 4).
-  python run_demo.py --batch --submit
-    - Envía el lote real, sondea, maneja fallos por custom_id, reenvía el doc
+  py run_demo.py --batch --submit
+    - Envía el lote real (POST a /v1/messages/batches; asíncrono, ventana de hasta
+      24 h, 50% de descuento), sondea, maneja fallos por custom_id, reenvía el doc
       sobredimensionado como troceos, fusiona e imprime el tiempo transcurrido
       frente al SLA (Paso 4).
 
@@ -737,6 +757,21 @@ NOTAS DE FIABILIDAD / DISEÑO QUE MERECE ARTICULAR
     calibradas mueve el trabajo equivocado a los humanos. El análisis de precisión
     por campo/tipo es cómo compruebas que esa calibración y consistencia se
     cumplen de verdad.
+
+------------------------------------------------------------------------------
+VERIFICADO EN LOCAL
+------------------------------------------------------------------------------
+Ejecutado en Windows (PowerShell):
+  - Modo básico: los 3 documentos se extrajeron a la primera (attempts=1, sin
+    reintento). Los campos ausentes salieron null en vez de fabricarse (Paso 1);
+    el tipo fuera del enum cayó en "other" con su detail (Paso 1); la validación
+    no necesitó corrección (Paso 2); el few-shot manejó los tres formatos sin
+    fallos (Paso 3); el encaminamiento auto-aceptó los tres (review_rate 0.0) con
+    precisión del 100% por campo y por tipo (Paso 5).
+  - --batch (dry run): construyó el lote de 100 e identificó el documento
+    sobredimensionado para troceado, sin llamar a la API (Paso 4, estrategia).
+  - --submit: no ejecutado a propósito - no aporta nada conceptualmente nuevo
+    sobre lo ya demostrado y evita el gasto y la espera del ciclo asíncrono real.
 
 
 ##############################################################################
@@ -905,23 +940,37 @@ refieren al mismo primitivo de generación.
 ------------------------------------------------------------------------------
 6. REQUISITOS PREVIOS Y CÓMO EJECUTAR
 ------------------------------------------------------------------------------
-  1. Node.js instalado (el SDK ejecuta a través de la CLI de Claude Code incluida).
-  2. pip install claude-agent-sdk
-  3. Autenticar: define ANTHROPIC_API_KEY en el entorno (o usa una suscripción de
-     Claude autenticada que la CLI pueda recoger).
-  4. python cca_f_exercise_4_agentsdk.py
+  1. Node.js 18+ y la CLI de Claude Code, que el SDK de Python necesita por debajo
+     (no la incluye; a diferencia del SDK de TypeScript):
+         npm install -g @anthropic-ai/claude-code
+  2. py -m pip install claude-agent-sdk
+  3. Autenticar: lo recomendado para uso local es `claude login` con la suscripción
+     (Max/Pro); así el consumo sale del plan. ANTHROPIC_API_KEY es la alternativa
+     (factura a la cuenta de API) y, si está definida, TIENE PRIORIDAD sobre el
+     login de suscripción - para usar el plan conviene que no esté puesta
+     ($env:ANTHROPIC_API_KEY = $null en esa sesión de PowerShell).
+  4. py cca_f_exercise_4_agentsdk.py
 
-Este archivo NO se ejecutó durante la preparación porque el SDK requiere la CLI +
-Node + autenticación; se validó estáticamente (importa y se construye limpiamente
-contra claude-agent-sdk 0.2.107). Ejecútalo una vez tú mismo y captura la traza
-como evidencia, como con los demás ejercicios.
-
-Qué buscar en la salida:
+Confirmado en la salida de la ejecución:
   - Múltiples líneas [SubagentStart] apareciendo juntas  -> generación paralela (Paso 2).
   - Líneas [SPAWN] Agent/Task ...                         -> el coordinador delegando (Paso 1).
   - Texto de subagente con formato CLAIM / EVIDENCE / SOURCE / DATE -> hallazgos estructurados (Paso 3).
   - Un informe final con ESTABLISHED (tendencia creciente, ambas fuentes) y
     CONTESTED (4.2% WHO vs 5.1% OECD, ambas atribuidas) + COVERAGE GAPS -> Pasos 4 y 5.
+
+------------------------------------------------------------------------------
+VERIFICADO EN LOCAL
+------------------------------------------------------------------------------
+Ejecutado y verificado en Windows (PowerShell), con la suscripción Max vía
+`claude login`. Se ejecutó dos veces con resultados consistentes: como el modelo
+no es determinista, la redacción del informe varía entre ejecuciones, pero la
+estructura de fondo se mantiene estable - las dos cifras divergentes (WHO 4,2% /
+OECD 5,1%) siempre acaban bajo CONTESTED, cada una con su fuente y sin promediar
+ni descartar, mientras que la afirmación cualitativa compartida (la tendencia al
+alza) queda bajo ESTABLISHED. El subagente web, al no poder resolver el marcador
+"technology X", se propaga como laguna de cobertura. Esa estabilidad de la
+separación establecido/disputado pese a la variación de redacción es justo la
+señal de robustez que el Paso 5 busca.
 
 
 ------------------------------------------------------------------------------
