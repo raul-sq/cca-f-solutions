@@ -34,7 +34,10 @@ Una descripción más detallada de cada uno, con las decisiones técnicas, está
 ├── exercise-1-multitool-agent/          Agente + bucle agéntico + escalado (Messages API cruda)
 ├── exercise-2-team-workflow/            Configuración de Claude Code para equipo (CLAUDE.md, reglas, MCP)
 ├── exercise-3-extraction-pipeline/      Extracción estructurada + validación-reintento + lotes
-└── exercise-4-research-pipeline/        Coordinador-subagentes con el Claude Agent SDK
+├── exercise-4-research-pipeline/        Coordinador-subagentes con el Claude Agent SDK
+├── casos-practicos/                     (En crecimiento) Casos prácticos propios que vayan surgiendo
+└── recursos/
+    └── enlaces.md                       Enlaces de referencia para la preparación
 ```
 
 Cada carpeta tiene su propio `README.md` con objetivo, mapa de archivos y cómo ejecutarla.
@@ -42,13 +45,18 @@ Cada carpeta tiene su propio `README.md` con objetivo, mapa de archivos y cómo 
 ## Requisitos generales
 
 - **Python 3.10+**
-- Una clave de API en el entorno: `ANTHROPIC_API_KEY`
 - Dependencias por ejercicio (ver el README de cada carpeta). En general:
   `pip install anthropic` y, para el ejercicio 3, también `pydantic`.
-- El **ejercicio 4** usa el Claude Agent SDK (`pip install claude-agent-sdk`),
-  que incluye la CLI de Claude Code y requiere **Node.js**.
+- **Autenticación.** Los ejercicios 1 y 3 usan el SDK `anthropic` y se facturan a
+  la cuenta de API (necesitan `ANTHROPIC_API_KEY` en el entorno). El **ejercicio
+  4** usa el Claude Agent SDK y se autentica preferentemente con `claude login`
+  (suscripción Max/Pro); `ANTHROPIC_API_KEY` es la alternativa y, si está
+  definida, tiene prioridad sobre el login de suscripción.
+- El **ejercicio 4** requiere además **Node.js** y la CLI de Claude Code
+  (`npm install -g @anthropic-ai/claude-code`), que el SDK de Python necesita por
+  debajo (no la incluye; a diferencia del SDK de TypeScript).
 
-> Las claves nunca están en el código: todos los ejemplos leen `ANTHROPIC_API_KEY`
+> Las credenciales nunca están en el código: los ejemplos leen la clave o el login
 > del entorno. Copia el `.env.example` correspondiente a `.env` (ignorado por git)
 > y rellena tus valores.
 
